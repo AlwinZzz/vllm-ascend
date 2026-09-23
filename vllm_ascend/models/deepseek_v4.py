@@ -391,6 +391,20 @@ class DeepseekV4MoE(nn.Module):
         eplb_config = parallel_config.eplb_config
         self.enable_eplb = parallel_config.enable_eplb
 
+        if self.tp_size > 1 and not parallel_config.enable_expert_parallel:
+            # MoE tensor parallelism: every rank holds all experts with the FFN
+            # intermediate dim sharded. Expert rebalancing is meaningless there
+            # and its redundant-expert layout conflicts with TP weight sharding.
+            if self.enable_eplb:
+                raise ValueError(
+                    "EPLB is not supported when MoE runs in tensor parallel mode (expert parallel disabled)."
+                )
+            if config.moe_intermediate_size % self.tp_size != 0:
+                raise ValueError(
+                    f"moe_intermediate_size={config.moe_intermediate_size} must be divisible by "
+                    f"tensor_parallel_size={self.tp_size}."
+                )
+
         self.n_redundant_experts = eplb_config.num_redundant_experts
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
@@ -744,13 +758,19 @@ class DeepseekV4Attention(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         self.dim = config.hidden_size
         self.n_heads = config.num_attention_heads
-        self.n_local_heads = config.num_attention_heads // tp_size
+        if self.n_heads % tp_size != 0:
+            raise ValueError(
+                f"num_attention_heads={self.n_heads} must be divisible by tensor_parallel_size={tp_size}."
+            )
+        self.n_local_heads = self.n_heads // tp_size
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.head_dim = config.head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.nope_head_dim = config.head_dim - config.qk_rope_head_dim
         self.n_groups = config.o_groups
+        if self.n_groups % tp_size != 0:
+            raise ValueError(f"o_groups={self.n_groups} must be divisible by tensor_parallel_size={tp_size}.")
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
         self.eps = config.rms_norm_eps

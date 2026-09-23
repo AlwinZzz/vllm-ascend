@@ -19,6 +19,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.qb_tp_exchange import get_qb_tp_exchange
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     maybe_save_kv_layer_to_connector,
@@ -32,6 +33,7 @@ from vllm_ascend.distributed.parallel_state import get_otp_group
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.cv_linear import CVLinearWrapper
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+from vllm_ascend.ops.linear_op import DSV4QBColumnParallelOp
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (
@@ -1781,6 +1783,22 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         self.attn_sink = kwargs["attn_sink"]
 
+        # Fine-grained QB TP (see vllm_ascend/attention/qb_tp_exchange.py):
+        # wq_b is head-sharded across the QB group while tokens stay
+        # DP-distributed. Detection is per layer via the bound custom op, so
+        # draft models that keep a replicated wq_b are naturally excluded.
+        self.qb_exchange = None
+        self.qb_n_local_heads = self.n_local_heads
+        qb_op = getattr(self.wq_b, "custom_op", None)
+        if isinstance(qb_op, DSV4QBColumnParallelOp):
+            if _is_w8a8_dynamic(self.wq_b):
+                raise ValueError(
+                    "qb_tensor_parallel_size does not support W8A8-dynamic wq_b yet; "
+                    "use a bf16 or weight-only quantized wq_b."
+                )
+            self.qb_exchange = get_qb_tp_exchange(qb_op.tp_size)
+            self.qb_n_local_heads = self.num_heads // qb_op.tp_size
+
         ascend_config = get_ascend_config()
         self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
         self.vllm_config = get_current_vllm_config()
@@ -1935,6 +1953,36 @@ class AscendDSAImpl(DSAAttentionImpl):
             x = x_rot.reshape(1, num_tokens, -1, rotary_dim)
         return x
 
+    def _qb_gather_input(self, qr, cos, sin):
+        """QB TP: pad + AllGather token-major tensors across the QB group."""
+        if self.qb_exchange is None:
+            return qr, cos, sin
+        return self.qb_exchange.gather_tokens(qr, cos, sin)
+
+    def _qb_return_heads(self, q, num_tokens):
+        """QB TP: all-to-all head shards back to their token owners."""
+        if self.qb_exchange is None:
+            return q
+        return self.qb_exchange.return_heads(q, num_tokens, self.qb_n_local_heads)
+
+    def _qb_profile_run(self, num_tokens, dtype, device):
+        """Exercise the QB collectives on zero inputs so they are captured by
+        the ACL graph (same pattern as the o_proj fine-grained TP path)."""
+        qr = torch.zeros((num_tokens, self.q_lora_rank), dtype=dtype, device=device)
+        cos = torch.zeros((num_tokens, self.rope_head_dim), dtype=dtype, device=device)
+        sin = torch.zeros_like(cos)
+        qr_g, cos_g, sin_g = self.qb_exchange.gather_tokens(qr, cos, sin)
+        q = self.wq_b(qr_g).unflatten(-1, (self.qb_n_local_heads, self.head_dim))
+        q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            q.unsqueeze(1),
+            cos_g,
+            sin_g,
+            rotary_mode="interleave",
+            partial_slice=[self.nope_head_dim, self.head_dim],
+        )
+        self.qb_exchange.return_heads(q, num_tokens, self.qb_n_local_heads)
+
     def _forward_o_proj(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         num_tokens = o_proj_input.shape[0]
         group_hidden_dim = o_proj_input.shape[1] * o_proj_input.shape[2] // self.n_local_groups
@@ -2065,6 +2113,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                 self._forward_o_proj(o_proj_input, output)
             else:
                 output.fill_(0)
+            if self.qb_exchange is not None:
+                self._qb_profile_run(forward_context.num_tokens, hidden_states.dtype, hidden_states.device)
             return output
         if not isinstance(attn_metadata, list):
             attn_metadata = [attn_metadata]
@@ -2167,16 +2217,19 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         if is_prefill:
             qr = self.q_norm(wq_a_result)
-            q_b_quant, q_b_scale = self.cv_wq_b.quantize(qr)
+            qr_qb, cos_qb, sin_qb = self._qb_gather_input(qr, cos, sin)
+            q_b_quant, q_b_scale = self.cv_wq_b.quantize(qr_qb)
             qr_pertoken_scale = None
         elif is_w8a8:
             qr, qr_pertoken_scale = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
                 wq_a_result, self.q_norm.weight, epsilon=self.eps
             )
             q_b_quant, q_b_scale = qr, qr_pertoken_scale
+            cos_qb, sin_qb = cos, sin
         else:
             qr = self.q_norm(wq_a_result)
-            q_b_quant, q_b_scale = qr, None
+            qr_qb, cos_qb, sin_qb = self._qb_gather_input(qr, cos, sin)
+            q_b_quant, q_b_scale = qr_qb, None
             qr_pertoken_scale = None
 
         main_stream.wait_stream(aux_stream)
@@ -2199,7 +2252,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, slot_mapping)
 
         if is_prefill:
-            q = self.cv_wq_b.matmul(q_b_quant, q_b_scale).unflatten(-1, (self.n_local_heads, self.head_dim))
+            q = self.cv_wq_b.matmul(q_b_quant, q_b_scale).unflatten(-1, (self.qb_n_local_heads, self.head_dim))
         elif is_w8a8:
             q = torch_npu.npu_quant_matmul(
                 q_b_quant,
@@ -2208,9 +2261,9 @@ class AscendDSAImpl(DSAAttentionImpl):
                 pertoken_scale=q_b_scale,
                 bias=self.wq_b.bias,
                 output_dtype=hidden_states.dtype,
-            ).unflatten(-1, (self.n_local_heads, self.head_dim))
+            ).unflatten(-1, (self.qb_n_local_heads, self.head_dim))
         else:
-            q = self.cv_wq_b.matmul(q_b_quant, q_b_scale).unflatten(-1, (self.n_local_heads, self.head_dim))
+            q = self.cv_wq_b.matmul(q_b_quant, q_b_scale).unflatten(-1, (self.qb_n_local_heads, self.head_dim))
 
         # Join the Q and SWA-KV branches, then reuse the auxiliary stream for
         # independent tail work while q_rms[V] + rope[V] run on the main stream.
@@ -2228,11 +2281,12 @@ class AscendDSAImpl(DSAAttentionImpl):
         q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             q.unsqueeze(1),
-            cos,
-            sin,
+            cos_qb,
+            sin_qb,
             rotary_mode="interleave",
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
+        q = self._qb_return_heads(q, hidden_states.shape[0])
 
         return q, qr, qr_pertoken_scale, tail_overlap_output
 
@@ -2334,20 +2388,23 @@ class AscendDSAImpl(DSAAttentionImpl):
                     pertoken_scale=qr_pertoken_scale,
                     bias=self.wq_b.bias,
                     output_dtype=hidden_states.dtype,
-                ).unflatten(-1, (self.n_local_heads, self.head_dim))
+                ).unflatten(-1, (self.qb_n_local_heads, self.head_dim))
+                cos_qb, sin_qb = cos, sin
             else:
                 qr = self.q_norm(q_a)
-                q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+                qr_qb, cos_qb, sin_qb = self._qb_gather_input(qr, cos, sin)
+                q = self.wq_b(qr_qb).unflatten(-1, (self.qb_n_local_heads, self.head_dim))
                 qr_pertoken_scale = None
             q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
 
             torch.ops._C_ascend.inplace_partial_rotary_mul(
                 q.unsqueeze(1),
-                cos,
-                sin,
+                cos_qb,
+                sin_qb,
                 rotary_mode="interleave",
                 partial_slice=[self.nope_head_dim, self.head_dim],
             )
+            q = self._qb_return_heads(q, hidden_states.shape[0])
             # win kv & tok_dis
             if share_hs_quant:
                 kv = torch_npu.npu_quant_matmul(
@@ -2660,7 +2717,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                     pertoken_scale=qr_pertoken_scale,
                     bias=self.wq_b.bias,
                     output_dtype=hidden_states.dtype,
-                ).unflatten(-1, (self.n_local_heads, self.head_dim))
+                ).unflatten(-1, (self.qb_n_local_heads, self.head_dim))
+                cos_qb, sin_qb = cos, sin
             else:
                 if share_hs_quant:
                     q_a = torch_npu.npu_quant_matmul(
@@ -2671,21 +2729,23 @@ class AscendDSAImpl(DSAAttentionImpl):
                         bias=self.wq_a.bias,
                         output_dtype=hidden_states.dtype,
                     )
-                    qr = q = self.q_norm(q_a)
+                    qr = self.q_norm(q_a)
                 else:
-                    qr = q = self.q_norm(self.wq_a(hidden_states))
-                q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
+                    qr = self.q_norm(self.wq_a(hidden_states))
+                qr_qb, cos_qb, sin_qb = self._qb_gather_input(qr, cos, sin)
+                q = self.wq_b(qr_qb).unflatten(-1, (self.qb_n_local_heads, self.head_dim))
                 qr_pertoken_scale = None
 
             q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
 
             torch.ops._C_ascend.inplace_partial_rotary_mul(
                 q.unsqueeze(1),
-                cos,
-                sin,
+                cos_qb,
+                sin_qb,
                 rotary_mode="interleave",
                 partial_slice=[self.nope_head_dim, self.head_dim],
             )
+            q = self._qb_return_heads(q, hidden_states.shape[0])
 
             # win kv & tok_dis
             if share_hs_quant:

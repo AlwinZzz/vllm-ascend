@@ -60,6 +60,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import (
     get_mlp_tp_group,
     get_otp_group,
+    get_qb_tp_group,
 )
 from vllm_ascend.utils import (
     enable_dsa_cp,
@@ -67,6 +68,7 @@ from vllm_ascend.utils import (
     is_vl_model,
     mlp_tp_enable,
     oproj_tp_enable,
+    qb_tp_enable,
     shared_expert_dp_enabled,
 )
 
@@ -208,6 +210,29 @@ class DSV4OProjColumnParallelOp(CustomColumnParallelOp):
     @property
     def comm_group(self):
         return get_otp_group()
+
+    def apply_impl(
+        self,
+        input_: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        bias = self.bias if not self.skip_bias_add else None
+        assert self.quant_method is not None
+        output_parallel = self.quant_method.apply(self.layer, input_, bias)
+        output_bias = self.bias if self.skip_bias_add else None
+        return output_parallel, output_bias
+
+
+class DSV4QBColumnParallelOp(CustomColumnParallelOp):
+    """Bind DSV4 wq_b weight sharding to the fine-grained QB TP group.
+
+    Communication-free: the token AllGather / head all-to-all exchanges are
+    driven by the DSA attention impl (vllm_ascend/attention/qb_tp_exchange.py);
+    this op only makes weight sharding and the local matmul use the QB group.
+    """
+
+    @property
+    def comm_group(self):
+        return get_qb_tp_group()
 
     def apply_impl(
         self,
@@ -466,9 +491,20 @@ def _is_head_wise_attention_gate(prefix: str, output_size: int | None) -> bool:
 
 def _get_column_parallel_op(
     prefix, layer, output_size: int | None = None
-) -> MLPColumnParallelOp | DSV4OProjColumnParallelOp | SequenceColumnParallelOp | ShardedCPColumnParallelOp | None:
+) -> (
+    MLPColumnParallelOp
+    | DSV4OProjColumnParallelOp
+    | DSV4QBColumnParallelOp
+    | SequenceColumnParallelOp
+    | ShardedCPColumnParallelOp
+    | None
+):
     if enable_dsa_cp() and ("q_b_proj" in prefix or "kv_b_proj" in prefix):
         return ShardedCPColumnParallelOp(layer)
+    # DSV4 main-model wq_b under fine-grained QB TP; the indexer keeps its own
+    # replicated wq_b and draft (MTP) layers stay replicated in this phase.
+    if "wq_b" in prefix and "indexer" not in prefix and "mtp" not in prefix and qb_tp_enable():
+        return DSV4QBColumnParallelOp(layer)
     if "wo_a" in prefix and oproj_tp_enable():
         return DSV4OProjColumnParallelOp(layer)
     if "gate_up_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
@@ -532,6 +568,7 @@ def get_parallel_op(disable_tp, prefix, layer, direct, output_size: int | None =
     custom_op: (
         MLPColumnParallelOp
         | DSV4OProjColumnParallelOp
+        | DSV4QBColumnParallelOp
         | SequenceColumnParallelOp
         | MLPRowParallelOp
         | OProjRowParallelOp
