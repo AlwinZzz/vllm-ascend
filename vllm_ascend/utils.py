@@ -850,6 +850,10 @@ def olora_tp_enable() -> bool:
     return get_ascend_config().finegrained_tp_config.olora_tensor_parallel_size > 1
 
 
+def qb_tp_enable() -> bool:
+    return get_ascend_config().finegrained_tp_config.qb_tensor_parallel_size > 1
+
+
 def mlp_tp_enable() -> bool:
     return get_ascend_config().finegrained_tp_config.mlp_tensor_parallel_size > 0
 

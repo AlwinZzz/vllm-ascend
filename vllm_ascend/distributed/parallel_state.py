@@ -12,6 +12,7 @@ _MLP_TP: GroupCoordinator | None = None
 _OTP: GroupCoordinator | None = None
 _LMTP: GroupCoordinator | None = None
 _EMBED_TP: GroupCoordinator | None = None
+_QB_TP: GroupCoordinator | None = None
 
 _P_TP: GroupCoordinator | None = None
 
@@ -92,11 +93,12 @@ def init_ascend_model_parallel(
             group_ranks, get_world_group().local_rank, backend, group_name="dynamic_eplb"
         )
 
-    # Initialize fine-grained TP process groups on Ascend for four components:
+    # Initialize fine-grained TP process groups on Ascend for five components:
     # 1. LM Head: output logits projection (`lmhead_tensor_parallel_size`)
     # 2. O Proj: attention output projection (`oproj_tensor_parallel_size`)
     # 3. Embedding: The token embedding table at the input of the model (`embedding_tensor_parallel_size`)
     # 4. MLP: feed-forward network in transformer blocks (`mlp_tensor_parallel_size`)
+    # 5. Q_B: DSV4 wq_b projection (`qb_tensor_parallel_size`)
     _group_cache = {}
 
     def _create_or_get_group(group_size: int, group_name: str) -> GroupCoordinator:
@@ -121,8 +123,9 @@ def init_ascend_model_parallel(
     lmhead_tp_size = get_ascend_config().finegrained_tp_config.lmhead_tensor_parallel_size
     embedding_tp_size = get_ascend_config().finegrained_tp_config.embedding_tensor_parallel_size
     mlp_tp_size = get_ascend_config().finegrained_tp_config.mlp_tensor_parallel_size
+    qb_tp_size = get_ascend_config().finegrained_tp_config.qb_tensor_parallel_size
 
-    global _OTP, _LMTP, _EMBED_TP, _MLP_TP
+    global _OTP, _LMTP, _EMBED_TP, _MLP_TP, _QB_TP
 
     if otp_size > 0:
         _OTP = _create_or_get_group(otp_size, "otp")
@@ -132,6 +135,8 @@ def init_ascend_model_parallel(
         _EMBED_TP = _create_or_get_group(embedding_tp_size, "emtp")
     if mlp_tp_size > 0:
         _MLP_TP = _create_or_get_group(mlp_tp_size, "mlptp")
+    if qb_tp_size > 1:
+        _QB_TP = _create_or_get_group(qb_tp_size, "qbtp")
 
 
 def model_parallel_initialized():
@@ -161,6 +166,11 @@ def get_lmhead_tp_group() -> GroupCoordinator:
 def get_embed_tp_group() -> GroupCoordinator:
     assert _EMBED_TP is not None, "emtp group is not initialized"
     return _EMBED_TP
+
+
+def get_qb_tp_group() -> GroupCoordinator:
+    assert _QB_TP is not None, "qb tensor parallel group is not initialized"
+    return _QB_TP
 
 
 def get_p_tp_group() -> GroupCoordinator:
@@ -198,6 +208,11 @@ def destroy_ascend_model_parallel():
     if _OTP:
         _OTP.destroy()
     _OTP = None
+
+    global _QB_TP
+    if _QB_TP:
+        _QB_TP.destroy()
+    _QB_TP = None
 
     global _P_TP
     if _P_TP:

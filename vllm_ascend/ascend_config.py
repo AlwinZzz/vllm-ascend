@@ -524,6 +524,7 @@ class FinegrainedTPConfig:
         self.embedding_tensor_parallel_size = finegrained_tp_config.get("embedding_tensor_parallel_size", 0)
         self.mlp_tensor_parallel_size = finegrained_tp_config.get("mlp_tensor_parallel_size", 0)
         self.olora_tensor_parallel_size = finegrained_tp_config.get("olora_tensor_parallel_size", 0)
+        self.qb_tensor_parallel_size = finegrained_tp_config.get("qb_tensor_parallel_size", 0)
 
         enabled_configs = []
         if self.oproj_tensor_parallel_size > 0:
@@ -560,6 +561,36 @@ class FinegrainedTPConfig:
                 raise AssertionError(
                     "olora_tensor_parallel_size is only supported in pd scenario and can only be used in D node."
                 )
+        if self.qb_tensor_parallel_size > 1:
+            enabled_configs.append(f"qb_tensor_parallel_size={self.qb_tensor_parallel_size}")
+            # wq_b is head-sharded across the QB group (which splits DP ranks)
+            # and the token gather / head all-to-all exchanges assume DP token
+            # ownership; standard TP replicates tokens and shards heads on a
+            # different rank axis, so the two cannot be combined.
+            if vllm_config.parallel_config.tensor_parallel_size > 1:
+                raise AssertionError(
+                    "qb_tensor_parallel_size currently requires "
+                    "tensor_parallel_size == 1, got "
+                    f"{vllm_config.parallel_config.tensor_parallel_size}."
+                )
+            # The static AllGather / all-to-all exchange buffers are sized for
+            # graph replay and require ACL graph capture, same as oproj TP.
+            if vllm_config.model_config and vllm_config.model_config.enforce_eager:
+                raise AssertionError("qb_tensor_parallel_size is only supported in graph mode")
+            if vllm_config.kv_transfer_config is None or not vllm_config.kv_transfer_config.is_kv_consumer:
+                raise AssertionError(
+                    "qb_tensor_parallel_size is only supported in pd scenario and can only be used in D node."
+                )
+            additional_config = getattr(vllm_config, "additional_config", None) or {}
+            if bool(additional_config.get("enable_dsa_cp", False)):
+                raise AssertionError("qb_tensor_parallel_size is mutually exclusive with DSA context parallel.")
+            hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+            num_heads = getattr(hf_text_config, "num_attention_heads", 0)
+            if num_heads and num_heads % self.qb_tensor_parallel_size != 0:
+                raise AssertionError(
+                    f"num_attention_heads={num_heads} must be divisible by "
+                    f"qb_tensor_parallel_size={self.qb_tensor_parallel_size}."
+                )
         if self.lmhead_tensor_parallel_size > 0:
             enabled_configs.append(f"lmhead_tensor_parallel_size={self.lmhead_tensor_parallel_size}")
         if self.embedding_tensor_parallel_size > 0:
@@ -572,6 +603,7 @@ class FinegrainedTPConfig:
             self.embedding_tensor_parallel_size,
             self.mlp_tensor_parallel_size,
             self.olora_tensor_parallel_size,
+            self.qb_tensor_parallel_size,
         ]
         for module_tp_size in module_tp_sizes:
             # If it is a dense model, then expert parallel is not needed,
